@@ -2905,6 +2905,12 @@ impl Window {
         self.rendered_frame.scene.underlines.clone()
     }
 
+    /// Returns the shadows in the most recently rendered frame's scene, in scaled pixels.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_shadows(&self) -> Vec<Shadow> {
+        self.rendered_frame.scene.shadows.clone()
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -3324,6 +3330,30 @@ impl Window {
     #[inline]
     fn snap_border_widths(&self, edges: Edges<Pixels>) -> Edges<ScaledPixels> {
         edges.map(|e| self.snap_stroke(*e))
+    }
+
+    /// Offsets and dilates an element's snapped bounds by whole device pixels. Snapping the
+    /// shadow independently of its element made a hard 1px ring 1 or 2 device pixels wide
+    /// per side at fractional scale factors.
+    fn snap_shadow_bounds(
+        &self,
+        element_bounds: Bounds<ScaledPixels>,
+        offset: Point<Pixels>,
+        dilation: Pixels,
+    ) -> Bounds<ScaledPixels> {
+        let scale_factor = self.scale_factor();
+        let offset_x = round_to_device_pixel(offset.x.0, scale_factor);
+        let offset_y = round_to_device_pixel(offset.y.0, scale_factor);
+        let dilation =
+            round_stroke_to_device_pixel(dilation.0.abs(), scale_factor).copysign(dilation.0);
+        let left = element_bounds.left().0 + offset_x - dilation;
+        let top = element_bounds.top().0 + offset_y - dilation;
+        let right = (element_bounds.right().0 + offset_x + dilation).max(left);
+        let bottom = (element_bounds.bottom().0 + offset_y + dilation).max(top);
+        Bounds::from_corners(
+            point(ScaledPixels(left), ScaledPixels(top)),
+            point(ScaledPixels(right), ScaledPixels(bottom)),
+        )
     }
 
     /// Floors the near edge and ceils the far edge, producing a strict superset of the raw region.
@@ -4584,17 +4614,20 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
-        let element_bounds = self.cover_bounds(bounds);
+        let element_bounds = self.snap_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
             if shadow.inset {
                 continue;
             }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                bounds: self.snap_shadow_bounds(
+                    element_bounds,
+                    shadow.offset,
+                    shadow.spread_radius,
+                ),
                 content_mask,
                 corner_radii: corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
@@ -4620,13 +4653,12 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
-        let element_bounds = self.cover_bounds(bounds);
+        let element_bounds = self.snap_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
             if !shadow.inset {
                 continue;
             }
-            let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
             // Clamp at zero so a large spread can't produce negative radii, which would
             // break the SDF in the shader.
             let zero = Pixels::ZERO;
@@ -4639,7 +4671,11 @@ impl Window {
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(hole),
+                bounds: self.snap_shadow_bounds(
+                    element_bounds,
+                    shadow.offset,
+                    -shadow.spread_radius,
+                ),
                 content_mask,
                 corner_radii: hole_corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
@@ -7919,11 +7955,11 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, ContentMask, Context, DispatchPhase,
-        DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
-        FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
-        Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
+        AnyWindowHandle, AppContext as _, Bounds, BoxShadow, ContentMask, Context, DispatchPhase,
+        DragMoveEvent, Edges, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
+        FileDropEvent, FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement,
+        KeyDownEvent, Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+        ParentElement, Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
@@ -8514,6 +8550,76 @@ mod tests {
                 window_state(&mut cx),
                 (scale_factor, expected_bounds, resized_size)
             );
+        }
+    }
+
+    struct ShadowRingView;
+
+    impl Render for ShadowRingView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let ring =
+                |spread| BoxShadow::new(px(0.), px(0.), hsla(0., 0., 0., 1.)).spread_radius(spread);
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(13.))
+                    .top(px(7.))
+                    .w(px(101.))
+                    .h(px(43.))
+                    .bg(hsla(0., 0., 1., 1.))
+                    .border(px(1.))
+                    .border_color(hsla(0., 0., 0.5, 1.))
+                    .shadow(vec![ring(px(1.)), ring(px(1.)).inset()]),
+            )
+        }
+    }
+
+    /// A 1px shadow ring around an element must be exactly as wide as the element's 1px
+    /// border on every side, also at fractional scale factors where the element's edges fall
+    /// between device pixels.
+    #[gpui::test]
+    fn test_hard_shadow_rings_match_the_border_width(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| ShadowRingView);
+        let handle = cx.update(|window, _| window.window_handle());
+        for scale_factor in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            cx.simulate_window_scale_factor_change(handle, scale_factor);
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.update(|window, _| {
+                let element = window
+                    .painted_quads()
+                    .into_iter()
+                    .find(|quad| quad.border_color == hsla(0., 0., 0.5, 1.))
+                    .expect("element border is painted");
+                let border = element.border_widths.top;
+                assert!(border.0 >= 1., "at {scale_factor}");
+                assert_eq!(
+                    element.border_widths,
+                    Edges::all(border),
+                    "at {scale_factor}"
+                );
+                let shadows = window.painted_shadows();
+                let ring = shadows
+                    .iter()
+                    .find(|shadow| shadow.inset == 0)
+                    .expect("drop ring is painted");
+                let inner = shadows
+                    .iter()
+                    .find(|shadow| shadow.inset != 0)
+                    .expect("inset ring is painted");
+                assert_eq!(ring.element_bounds, element.bounds, "at {scale_factor}");
+                assert_eq!(
+                    ring.bounds,
+                    element.bounds.dilate(border),
+                    "at {scale_factor}"
+                );
+                assert_eq!(inner.element_bounds, element.bounds, "at {scale_factor}");
+                assert_eq!(
+                    inner.bounds,
+                    element.bounds.dilate(ScaledPixels(-border.0)),
+                    "at {scale_factor}"
+                );
+            });
         }
     }
 
