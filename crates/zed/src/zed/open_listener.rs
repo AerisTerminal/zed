@@ -692,6 +692,10 @@ async fn resolve_open_behavior(
     requests: &mut mpsc::UnboundedReceiver<CliRequest>,
     cx: &mut AsyncApp,
 ) -> Option<settings::CliDefaultOpenBehavior> {
+    if paths.is_empty() {
+        return None;
+    }
+
     let has_existing_windows = cx.update(|cx| {
         cx.windows()
             .iter()
@@ -842,10 +846,10 @@ async fn open_workspaces(
     cwd: Option<PathBuf>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    if paths.is_empty()
-        && diff_paths.is_empty()
-        && !matches!(open_behavior, cli::OpenBehavior::AlwaysNew)
-    {
+    if paths.is_empty() && diff_paths.is_empty() && open_behavior != cli::OpenBehavior::AlwaysNew {
+        if workspace::activate_any_workspace_window(cx).is_some() {
+            return Ok(());
+        }
         return restore_or_create_workspace(app_state, cx).await;
     }
 
@@ -1127,7 +1131,7 @@ mod tests {
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
-    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _, VisualTestContext};
     use language::LineEnding;
     use remote::SshConnectionOptions;
     use rope::Rope;
@@ -1151,6 +1155,16 @@ mod tests {
         fn send(&self, response: CliResponse) -> anyhow::Result<()> {
             self.0
                 .send(response)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        }
+    }
+
+    struct AsyncResponseSender(mpsc::UnboundedSender<CliResponse>);
+
+    impl CliResponseSink for AsyncResponseSender {
+        fn send(&self, response: CliResponse) -> anyhow::Result<()> {
+            self.0
+                .unbounded_send(response)
                 .map_err(|error| anyhow::anyhow!("{error}"))
         }
     }
@@ -2740,11 +2754,13 @@ mod tests {
             .unwrap();
         futures::future::join_all(serialization_tasks).await;
 
+        VisualTestContext::from_window(*multi_workspace, cx).deactivate_window();
         multi_workspace
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.windows().len(), 0);
+        cx.read(|cx| assert_eq!(cx.active_window(), None));
 
         cx.update(|cx| {
             app_state.session.update(cx, |app_session, _cx| {
@@ -2754,7 +2770,7 @@ mod tests {
 
         let (status, prompt_shown) = run_cli_with_zed_handler(
             cx,
-            app_state,
+            app_state.clone(),
             make_cli_open_request(Vec::new(), cli::OpenBehavior::Default),
             None,
         );
@@ -2778,6 +2794,17 @@ mod tests {
                 );
             })
             .unwrap();
+
+        let windows = cx.windows();
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            make_cli_open_request(Vec::new(), cli::OpenBehavior::Default),
+            None,
+        );
+        assert_eq!(status, 0);
+        assert!(!prompt_shown);
+        assert_eq!(cx.windows(), windows);
     }
 
     #[gpui::test]
@@ -3005,6 +3032,224 @@ mod tests {
         assert_eq!(status, 0);
         assert!(!prompt_shown, "no prompt should be shown with -n flag");
         assert_eq!(cx.windows().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_e2e_new_and_reuse_flags_with_same_file_roots(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({ "file.txt": "shared file", "other.txt": "replacement file" }),
+            )
+            .await;
+        open_workspace_file(
+            path!("/project/file.txt"),
+            OpenOptions::default(),
+            app_state.clone(),
+            cx,
+        )
+        .await;
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state.clone(),
+            make_cli_open_request(
+                vec![path!("/project/file.txt").to_owned()],
+                cli::OpenBehavior::AlwaysNew,
+            ),
+            None,
+        );
+        assert_eq!(status, 0);
+        assert!(!prompt_shown);
+        let windows = cx.windows();
+        assert_eq!(windows.len(), 2);
+        let mut workspace_ids = Vec::new();
+        for window in &windows {
+            window
+                .downcast::<MultiWorkspace>()
+                .unwrap()
+                .read_with(cx, |multi_workspace, cx| {
+                    let workspace = multi_workspace.workspace().read(cx);
+                    assert_eq!(
+                        workspace.root_paths(cx),
+                        vec![Arc::<Path>::from(Path::new(path!("/project/file.txt")))]
+                    );
+                    workspace_ids.push(workspace.database_id().unwrap());
+                })
+                .unwrap();
+        }
+        assert_ne!(workspace_ids[0], workspace_ids[1]);
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        for window in windows {
+            let window = window.downcast::<MultiWorkspace>().unwrap();
+            let tasks = window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.flush_all_serialization(window, cx)
+                })
+                .unwrap();
+            future::join_all(tasks).await;
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app_state.session.update(cx, |session, _| {
+                session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+        let (sender, receiver) = mpsc::unbounded();
+        drop(sender);
+        cx.update(|cx| crate::restore_and_open_workspaces(app_state.clone(), None, receiver, cx))
+            .await;
+        cx.run_until_parked();
+        let windows = cx.windows();
+        let mut restored_ids = windows
+            .iter()
+            .map(|window| {
+                window
+                    .downcast::<MultiWorkspace>()
+                    .unwrap()
+                    .read_with(cx, |multi_workspace, cx| {
+                        multi_workspace.workspace().read(cx).database_id().unwrap()
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        workspace_ids.sort();
+        restored_ids.sort();
+        assert_eq!(restored_ids, workspace_ids);
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            make_cli_open_request(
+                vec![path!("/project/other.txt").to_owned()],
+                cli::OpenBehavior::Reuse,
+            ),
+            None,
+        );
+        assert_eq!(status, 0);
+        assert!(!prompt_shown);
+        let mut original_window_ids = windows
+            .iter()
+            .map(|window| window.window_id())
+            .collect::<Vec<_>>();
+        original_window_ids.sort();
+        let mut window_ids = cx
+            .windows()
+            .iter()
+            .map(|window| window.window_id())
+            .collect::<Vec<_>>();
+        window_ids.sort();
+        assert_eq!(window_ids, original_window_ids);
+        let mut roots = cx
+            .windows()
+            .iter()
+            .map(|window| {
+                window
+                    .downcast::<MultiWorkspace>()
+                    .unwrap()
+                    .read_with(cx, |multi_workspace, cx| {
+                        multi_workspace.workspace().read(cx).root_paths(cx)
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        assert_eq!(
+            roots,
+            vec![
+                vec![Arc::<Path>::from(Path::new(path!("/project/file.txt")))],
+                vec![Arc::<Path>::from(Path::new(path!("/project/other.txt")))],
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_cli_wait_does_not_block_queued_file(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({ "wait.txt": "waited file", "queued.txt": "queued file" }),
+            )
+            .await;
+        let (requests, request_receiver) = mpsc::unbounded();
+        let (responses, mut response_receiver) = mpsc::unbounded();
+        let mut request = make_cli_open_request(
+            vec![path!("/project/wait.txt").to_owned()],
+            cli::OpenBehavior::AlwaysNew,
+        );
+        if let CliRequest::Open { wait, .. } = &mut request {
+            *wait = true;
+        }
+        requests.unbounded_send(request).unwrap();
+        let (sender, receiver) = mpsc::unbounded();
+        cx.update(|cx| {
+            crate::restore_and_open_workspaces(
+                app_state,
+                Some(OpenRequest {
+                    kind: Some(OpenRequestKind::CliConnection((
+                        request_receiver,
+                        Box::new(AsyncResponseSender(responses)),
+                    ))),
+                    ..OpenRequest::default()
+                }),
+                receiver,
+                cx,
+            )
+        })
+        .await;
+        sender
+            .unbounded_send(RawOpenRequest {
+                urls: vec![format!(
+                    "file://{}",
+                    urlencoding::encode(path!("/project/queued.txt"))
+                )],
+                open_behavior: Some(cli::OpenBehavior::AlwaysNew),
+                ..RawOpenRequest::default()
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+        assert!(poll!(response_receiver.next()).is_pending());
+        let mut contents = Vec::new();
+        for window in cx.windows() {
+            let text = window
+                .downcast::<MultiWorkspace>()
+                .unwrap()
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace
+                        .active_item_as::<Editor>(cx)
+                        .unwrap()
+                        .read(cx)
+                        .text(cx)
+                })
+                .unwrap();
+            if text == "waited file" {
+                VisualTestContext::from_window(window, cx).deactivate_window();
+                cx.update_window(window, |_, window, _| window.remove_window())
+                    .unwrap();
+            }
+            contents.push(text);
+        }
+        contents.sort();
+        assert_eq!(contents, vec!["queued file", "waited file"]);
+        let response = response_receiver
+            .filter(|response| future::ready(!matches!(response, CliResponse::Ping)))
+            .next()
+            .await
+            .unwrap();
+        assert!(
+            matches!(response, CliResponse::Exit { status: 0 }),
+            "{response:?}"
+        );
     }
 
     #[gpui::test]

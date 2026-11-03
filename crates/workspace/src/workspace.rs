@@ -1651,6 +1651,7 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    remote_bootstrap: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2154,6 +2155,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            remote_bootstrap: false,
         }
     }
 
@@ -2164,6 +2166,28 @@ impl Workspace {
         env: Option<HashMap<String, String>>,
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
         open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_with_workspace_id(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            None,
+            cx,
+        )
+    }
+
+    fn new_local_with_workspace_id(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        workspace_id: Option<WorkspaceId>,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
@@ -2189,7 +2213,13 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            let mut serialized_workspace = match workspace_id {
+                Some(workspace_id) => Some(
+                    db.workspace_for_id(workspace_id)
+                        .with_context(|| format!("Workspace {workspace_id:?} not found"))?,
+                ),
+                None => db.workspace_for_roots(paths_to_open.as_slice()),
+            };
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -2213,10 +2243,11 @@ impl Workspace {
                 }
             }
 
-            let workspace_id = if let Some(serialized_workspace) = serialized_workspace.as_ref() {
+            let mut workspace_id = if let Some(serialized_workspace) = serialized_workspace.as_ref()
+            {
                 serialized_workspace.id
             } else {
-                db.next_id().await.unwrap_or_else(|_| Default::default())
+                db.next_id().await?
             };
 
             let toolchains = db.toolchains(workspace_id).await?;
@@ -2254,6 +2285,20 @@ impl Workspace {
                         }
                     }
                 });
+            }
+
+            if serialized_workspace.is_some()
+                && cx.update(|cx| {
+                    app_state
+                        .workspace_store
+                        .read(cx)
+                        .workspaces()
+                        .filter_map(WeakEntity::upgrade)
+                        .any(|workspace| workspace.read(cx).database_id() == Some(workspace_id))
+                })
+            {
+                serialized_workspace = None;
+                workspace_id = db.next_id().await?;
             }
 
             let window_to_replace = match open_mode {
@@ -2917,6 +2962,10 @@ impl Workspace {
 
     pub fn is_restoring(&self) -> bool {
         self.restoring_workspace
+    }
+
+    pub fn set_remote_bootstrap(&mut self, remote_bootstrap: bool) {
+        self.remote_bootstrap = remote_bootstrap;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7974,13 +8023,21 @@ impl Workspace {
 
                 let db = WorkspaceDb::global(cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
+                let session = self.app_state.session.read(cx);
+                let current_session_id = Some(session.id().to_owned());
+                let last_session_id = session.last_session_id().map(str::to_owned);
                 cx.background_spawn(async move {
                     if let Some(docks) = default_docks {
                         persistence::write_default_dock_state(&kvp, docks)
                             .await
                             .log_err();
                     }
-                    db.save_workspace(serialized_workspace).await;
+                    db.save_workspace_preserving_sessions(
+                        serialized_workspace,
+                        current_session_id,
+                        last_session_id,
+                    )
+                    .await;
                 })
             }
             WorkspaceLocation::None => {
@@ -10481,13 +10538,14 @@ pub async fn restore_multiworkspace(
         .await
     } else {
         cx.update(|cx| {
-            Workspace::new_local(
+            Workspace::new_local_with_workspace_id(
                 active_workspace.paths.paths().to_vec(),
                 app_state.clone(),
                 None,
                 None,
                 None,
                 OpenMode::Add,
+                Some(active_workspace.workspace_id),
                 cx,
             )
         })
@@ -11059,7 +11117,11 @@ fn matches_remote_location(
     }
 }
 
-fn matches_requested_host(project: &Project, requested: &ProjectHost<'_>, cx: &App) -> bool {
+fn matches_requested_host(workspace: &Workspace, requested: &ProjectHost<'_>, cx: &App) -> bool {
+    if workspace.remote_bootstrap {
+        return false;
+    }
+    let project = workspace.project.read(cx);
     match requested {
         ProjectHost::Local => project.is_local(),
         ProjectHost::Remote(requested) => {
@@ -11101,7 +11163,11 @@ pub fn workspace_windows_for_location<'a>(
         .filter(move |multi_workspace| {
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
                 multi_workspace.workspaces().any(|workspace| {
-                    let project = workspace.read(cx).project.read(cx);
+                    let workspace = workspace.read(cx);
+                    if workspace.remote_bootstrap {
+                        return false;
+                    }
+                    let project = workspace.project.read(cx);
 
                     match (project.remote_connection_options(cx), serialized_location) {
                         (Some(connection), SerializedWorkspaceLocation::Remote(requested)) => {
@@ -11119,9 +11185,8 @@ fn preferred_target_for_files(host: &ProjectHost<'_>, cx: &App) -> Option<Worksp
     let target_for_window = |window: WindowHandle<MultiWorkspace>| {
         let multi_workspace = window.read(cx).ok()?;
         let active_workspace = multi_workspace.workspace();
-        let matches_host = |workspace: &Entity<Workspace>| {
-            matches_requested_host(workspace.read(cx).project.read(cx), host, cx)
-        };
+        let matches_host =
+            |workspace: &Entity<Workspace>| matches_requested_host(workspace.read(cx), host, cx);
 
         let workspace = if matches_host(active_workspace) {
             active_workspace
@@ -11176,7 +11241,7 @@ pub fn find_existing_workspace(
                         let workspace_ref = workspace.read(cx);
                         let project = workspace_ref.project.read(cx);
 
-                        if !matches_requested_host(project, host, cx) {
+                        if !matches_requested_host(workspace_ref, host, cx) {
                             continue;
                         }
 
@@ -11704,6 +11769,7 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    focus: bool,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
@@ -11749,6 +11815,7 @@ pub fn open_remote_project_with_new_connection(
             window,
             None,
             None,
+            focus,
             cx,
         )
         .await?;
@@ -11779,6 +11846,7 @@ pub fn open_remote_project_with_existing_connection(
             window,
             provisional_project_group_key,
             source_workspace,
+            true,
             cx,
         )
         .await
@@ -11794,6 +11862,7 @@ async fn open_remote_project_inner(
     window: WindowHandle<MultiWorkspace>,
     provisional_project_group_key: Option<ProjectGroupKey>,
     source_workspace: Option<WeakEntity<Workspace>>,
+    focus: bool,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
     let mut project_paths_to_open = vec![];
@@ -11875,7 +11944,9 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            window.activate_window();
+            if focus {
+                window.activate_window();
+            }
             workspace.update(cx, |_workspace, cx| {
                 open_items(serialized_workspace, project_paths_to_open, window, cx)
             })
@@ -12788,6 +12859,7 @@ mod tests {
     };
     use project::{Project, ProjectEntryId, WorktreeId};
     use serde_json::json;
+    use session::Session;
     use settings::{SettingsStore, SplicingVec};
     use util::path;
     use util::rel_path::rel_path;
@@ -12927,6 +12999,37 @@ mod tests {
         assert!(!noise.relative_path);
         assert!(!noise.remote);
         assert!(!noise.branch);
+    }
+
+    #[gpui::test]
+    async fn test_remote_bootstrap_excluded_from_workspace_matching(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let location = SerializedWorkspaceLocation::Local;
+        assert_eq!(
+            cx.read(|cx| workspace_windows_for_location(&location, cx).collect::<Vec<_>>()),
+            vec![window]
+        );
+        let options = OpenOptions {
+            workspace_matching: WorkspaceMatching::MatchSubdirectory,
+            ..OpenOptions::default()
+        };
+        for (remote_bootstrap, expected) in [(true, None), (false, Some(window))] {
+            workspace.update(cx, |workspace, _| {
+                workspace.set_remote_bootstrap(remote_bootstrap);
+            });
+            assert_eq!(
+                cx.read(|cx| workspace_windows_for_location(&location, cx).collect::<Vec<_>>()),
+                expected.into_iter().collect::<Vec<_>>()
+            );
+            let existing =
+                find_existing_workspace(&[], &options, &ProjectHost::Local, &mut cx.to_async());
+            assert_eq!(existing.map(|target| target.window), expected);
+        }
     }
 
     #[gpui::test]
@@ -18501,6 +18604,140 @@ mod tests {
         let item_count_c = pane_c.read_with(cx, |pane, _| pane.items_len());
         assert_eq!(item_count_b, 0, "Pinned item in pane B should be closed");
         assert_eq!(item_count_c, 0, "Unpinned item in pane C should be closed");
+    }
+
+    #[gpui::test]
+    async fn test_same_root_windows_survive_restarts(cx: &mut TestAppContext) {
+        init_test(cx);
+        let app_state = cx.update(|cx| {
+            register_serializable_item::<TestItem>(cx);
+            AppState::test(cx)
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/project", json!({}))
+            .await;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let mut windows = Vec::new();
+        let mut workspace_ids = Vec::new();
+        for item_count in 1..=2 {
+            let result = cx
+                .update(|cx| {
+                    open_paths(
+                        &[PathBuf::from("/project")],
+                        app_state.clone(),
+                        OpenOptions {
+                            workspace_matching: WorkspaceMatching::None,
+                            open_mode: OpenMode::NewWindow,
+                            ..OpenOptions::default()
+                        },
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            let workspace_id = result
+                .workspace
+                .read_with(cx, |workspace, _| workspace.database_id().unwrap());
+            if let Some(previous_id) = workspace_ids.first() {
+                assert_ne!(workspace_id, *previous_id);
+            }
+            result
+                .window
+                .update(cx, |_, window, cx| {
+                    result.workspace.update(cx, |workspace, cx| {
+                        let pane = workspace.active_pane().clone();
+                        assert_eq!(pane.read(cx).items_len(), 0);
+                        pane.update(cx, |pane, cx| {
+                            for _ in 0..item_count {
+                                let item = cx.new(TestItem::new);
+                                pane.add_item(Box::new(item), true, false, None, window, cx);
+                            }
+                            pane.set_pinned_count(item_count - 1);
+                        });
+                        workspace.serialize_workspace_internal(window, cx)
+                    })
+                })
+                .unwrap()
+                .await;
+            windows.push(result.window);
+            workspace_ids.push(workspace_id);
+        }
+
+        for _ in 0..2 {
+            let previous_session = app_state
+                .session
+                .read_with(cx, |session, _| session.id().to_owned());
+            for window in windows.drain(..) {
+                window
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+            }
+            cx.run_until_parked();
+            app_state.session.update(cx, |session, _| {
+                session.replace_session_for_test(Session::test_with_old_session(
+                    previous_session.clone(),
+                ));
+            });
+            let mut locations = db
+                .last_session_workspace_locations(&previous_session, None, app_state.fs.as_ref())
+                .await
+                .unwrap();
+            locations.sort_by_key(|location| location.workspace_id);
+            assert_eq!(
+                locations
+                    .iter()
+                    .map(|location| location.workspace_id)
+                    .collect::<Vec<_>>(),
+                workspace_ids
+            );
+            let saved_windows =
+                cx.update(|cx| persistence::read_serialized_multi_workspaces(locations, cx));
+            assert_eq!(saved_windows.len(), 2);
+            for (index, saved_window) in saved_windows.into_iter().enumerate() {
+                let app_state = app_state.clone();
+                let window = cx
+                    .update(|cx| {
+                        cx.spawn(async move |cx| {
+                            restore_multiworkspace(saved_window, app_state, cx).await
+                        })
+                    })
+                    .await
+                    .unwrap();
+                window
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace().read(cx);
+                        assert_eq!(workspace.database_id(), Some(workspace_ids[index]));
+                        assert_eq!(
+                            workspace.root_paths(cx),
+                            vec![Arc::<Path>::from(Path::new("/project"))]
+                        );
+                        let pane = workspace.active_pane().read(cx);
+                        assert_eq!(pane.pinned_count(), index);
+                        assert_eq!(
+                            pane.items()
+                                .map(|item| {
+                                    item.downcast::<TestItem>().unwrap().read(cx).workspace_id
+                                })
+                                .collect::<Vec<_>>(),
+                            vec![Some(workspace_ids[index]); index + 1]
+                        );
+                    })
+                    .unwrap();
+                for _ in 0..2 {
+                    window
+                        .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace.workspace().update(cx, |workspace, cx| {
+                                workspace.serialize_workspace_internal(window, cx)
+                            })
+                        })
+                        .unwrap()
+                        .await;
+                }
+                windows.push(window);
+            }
+        }
     }
 
     #[gpui::test]

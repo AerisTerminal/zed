@@ -128,6 +128,7 @@ pub async fn open_remote_project(
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
+    let focus = open_options.focus.unwrap_or(true);
 
     let existing = find_existing_workspace(
         &paths,
@@ -155,13 +156,16 @@ pub async fn open_remote_project(
 
             let open_results = existing_window
                 .update(cx, |multi_workspace, window, cx| {
-                    window.activate_window();
+                    if focus {
+                        window.activate_window();
+                    }
                     multi_workspace.activate(existing_workspace.clone(), None, window, cx);
                     existing_workspace.update(cx, |workspace, cx| {
                         workspace.open_paths(
                             resolved_paths,
                             OpenOptions {
                                 visible: Some(existing.visible),
+                                focus: Some(focus),
                                 ..Default::default()
                             },
                             None,
@@ -214,6 +218,10 @@ pub async fn open_remote_project(
         let mut options =
             cx.update(|cx| (app_state.build_window_options)(workspace_position.display, cx));
         options.window_bounds = workspace_position.window_bounds;
+        options.show = true;
+        if let Some(focus) = open_options.focus {
+            options.focus = focus;
+        }
 
         let window = cx.open_window(options, |window, cx| {
             let project = project::Project::local(
@@ -231,6 +239,7 @@ pub async fn open_remote_project(
             );
             let workspace = cx.new(|cx| {
                 let mut workspace = Workspace::new(None, project, app_state.clone(), window, cx);
+                workspace.set_remote_bootstrap(true);
                 workspace.centered_layout = workspace_position.centered_layout;
                 workspace
             });
@@ -249,7 +258,9 @@ pub async fn open_remote_project(
             let connection_options = connection_options.clone();
             let initial_workspace = initial_workspace.clone();
             move |_multi_workspace: &mut MultiWorkspace, window, cx| {
-                window.activate_window();
+                if focus {
+                    window.activate_window();
+                }
                 initial_workspace.update(cx, |workspace, cx| {
                     workspace.hide_modal(window, cx);
                     workspace.toggle_modal(window, cx, |window, cx| {
@@ -353,6 +364,7 @@ pub async fn open_remote_project(
                     delegate.clone(),
                     app_state.clone(),
                     paths.clone(),
+                    focus,
                     cx,
                 )
             })
@@ -414,6 +426,10 @@ pub async fn open_remote_project(
         }
 
         break;
+    }
+
+    if created_new_window {
+        initial_workspace.update(cx, |workspace, _| workspace.set_remote_bootstrap(false));
     }
 
     Ok(window)

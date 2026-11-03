@@ -1164,6 +1164,7 @@ impl WorkspaceDb {
                 WHERE
                     paths IS ? AND
                     remote_connection_id IS ?
+                ORDER BY timestamp DESC, workspace_id DESC
                 LIMIT 1
             })
             .and_then(|mut prepared_statement| {
@@ -1494,7 +1495,19 @@ impl WorkspaceDb {
         ret
     }
 
+    #[cfg(test)]
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+        let session_id = workspace.session_id.clone();
+        self.save_workspace_preserving_sessions(workspace, session_id, None)
+            .await;
+    }
+
+    pub(crate) async fn save_workspace_preserving_sessions(
+        &self,
+        workspace: SerializedWorkspace,
+        current_session_id: Option<String>,
+        last_session_id: Option<String>,
+    ) {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
@@ -1591,17 +1604,25 @@ impl WorkspaceDb {
                 // Skip this for empty workspaces - they are identified by workspace_id, not paths.
                 // Multiple empty workspaces with different content should coexist.
                 if !paths.paths.is_empty() {
+                    let (current_session_id, last_session_id) = match remote_connection_id {
+                        Some(_) => (None, None),
+                        None => (current_session_id, last_session_id),
+                    };
                     conn.exec_bound(sql!(
                         DELETE
                         FROM workspaces
                         WHERE
                             workspace_id != ?1 AND
                             paths IS ?2 AND
-                            remote_connection_id IS ?3
+                            remote_connection_id IS ?3 AND
+                            (?4 IS NULL OR session_id IS NOT ?4) AND
+                            (?5 IS NULL OR session_id IS NOT ?5)
                     ))?((
                         workspace.id,
                         paths.paths.clone(),
                         remote_connection_id,
+                        current_session_id,
+                        last_session_id,
                     ))
                     .context("clearing out old locations")?;
                 }
@@ -2027,6 +2048,15 @@ impl WorkspaceDb {
         }
     }
 
+    async fn all_paths_exist(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        for path in paths {
+            if fs.metadata(path).await.ok().flatten().is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
         let mut any_dir = false;
         for path in paths {
@@ -2230,7 +2260,7 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
+            if Self::all_paths_exist(paths.paths(), fs).await {
                 workspaces.push(SessionWorkspace {
                     workspace_id,
                     location: SerializedWorkspaceLocation::Local,
@@ -3986,6 +4016,148 @@ mod tests {
                 .iter()
                 .all(|workspace| workspace.workspace_id != WorkspaceId(1)),
             "scratch-only workspace must not appear in the recent-projects UI"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_file_only_workspace_restores_from_last_session(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/files", json!({ "one.rs": "", "two.rs": "" }))
+            .await;
+        let db =
+            WorkspaceDb::open_test_db("test_file_only_workspace_restores_from_last_session").await;
+        for (id, paths) in [
+            (1, vec![Path::new("/files/one.rs")]),
+            (
+                2,
+                vec![Path::new("/files/two.rs"), Path::new("/files/one.rs")],
+            ),
+            (
+                3,
+                vec![Path::new("/files/one.rs"), Path::new("/files/missing.rs")],
+            ),
+        ] {
+            db.save_workspace(workspace_with(
+                id,
+                &paths,
+                pane_with_items(&[id]),
+                Some("session"),
+            ))
+            .await;
+        }
+        let sessions = db
+            .last_session_workspace_locations(
+                "session",
+                Some(vec![WindowId::from(2), WindowId::from(1)]),
+                fs.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                SessionWorkspace {
+                    workspace_id: WorkspaceId(2),
+                    location: SerializedWorkspaceLocation::Local,
+                    paths: PathList::new(&["/files/two.rs", "/files/one.rs"]),
+                    window_id: Some(WindowId::from(2)),
+                },
+                SessionWorkspace {
+                    workspace_id: WorkspaceId(1),
+                    location: SerializedWorkspaceLocation::Local,
+                    paths: PathList::new(&["/files/one.rs"]),
+                    window_id: Some(WindowId::from(1)),
+                },
+            ]
+        );
+        assert_eq!(
+            db.recent_project_workspaces(fs.as_ref()).await.unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_same_root_workspace_sessions() {
+        let db = WorkspaceDb::open_test_db("test_same_root_workspace_sessions").await;
+        let paths = &[Path::new("/project")];
+        for (id, session) in [
+            (1, None),
+            (2, Some("old")),
+            (3, Some("current")),
+            (4, Some("current")),
+        ] {
+            db.save_workspace(workspace_with(
+                id,
+                paths,
+                pane_with_items(&[id * 10]),
+                session,
+            ))
+            .await;
+        }
+        assert_eq!(db.workspace_for_id(WorkspaceId(1)), None);
+        assert_eq!(db.workspace_for_id(WorkspaceId(2)), None);
+        for id in [3, 4] {
+            assert_eq!(
+                db.workspace_for_id(WorkspaceId(id)).unwrap().center_group,
+                pane_with_items(&[id as u64 * 10])
+            );
+        }
+        db.set_timestamp_for_tests(WorkspaceId(3), "2000-01-01 00:00:00".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(db.workspace_for_roots(paths).unwrap().id, WorkspaceId(4));
+        for _ in 0..2 {
+            db.save_workspace_preserving_sessions(
+                workspace_with(5, paths, pane_with_items(&[50]), Some("next")),
+                Some("next".to_owned()),
+                Some("current".to_owned()),
+            )
+            .await;
+        }
+        for id in [3, 4, 5] {
+            assert_eq!(
+                db.workspace_for_id(WorkspaceId(id)).unwrap().center_group,
+                pane_with_items(&[id as u64 * 10])
+            );
+        }
+        db.save_workspace_preserving_sessions(
+            workspace_with(6, paths, pane_with_items(&[60]), Some("later")),
+            Some("later".to_owned()),
+            Some("next".to_owned()),
+        )
+        .await;
+        assert_eq!(db.workspace_for_id(WorkspaceId(3)), None);
+        assert_eq!(db.workspace_for_id(WorkspaceId(4)), None);
+        db.save_workspace_preserving_sessions(
+            workspace_with(5, paths, pane_with_items(&[50]), None),
+            Some("later".to_owned()),
+            Some("next".to_owned()),
+        )
+        .await;
+        for id in [5, 6] {
+            assert_eq!(
+                db.workspace_for_id(WorkspaceId(id)).unwrap().center_group,
+                pane_with_items(&[id as u64 * 10])
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_same_root_remote_workspace_replaces_session_row() {
+        let db =
+            WorkspaceDb::open_test_db("test_same_root_remote_workspace_replaces_session_row").await;
+        for id in [1, 2] {
+            db.save_workspace(SerializedWorkspace {
+                session_id: Some("session".to_owned()),
+                ..remote_workspace_with(id, "host", &[Path::new("/repo")])
+            })
+            .await;
+        }
+        assert_eq!(db.workspace_for_id(WorkspaceId(1)), None);
+        assert_eq!(
+            db.workspace_for_id(WorkspaceId(2))
+                .map(|workspace| workspace.id),
+            Some(WorkspaceId(2))
         );
     }
 
