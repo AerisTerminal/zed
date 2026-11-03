@@ -33,17 +33,17 @@ float3 apply_alpha_correction3(float3 a, float3 b, float4 g) {
     return a + a * (1.0f - a) * correction;
 }
 
-float apply_contrast_and_gamma_correction(float sample, float3 color, float enhanced_contrast_factor, float4 gamma_ratios) {
-    float enhanced_contrast = light_on_dark_contrast(enhanced_contrast_factor, color);
+// Windows Terminal scales the enhanced contrast down to zero for light colors
+// (light_on_dark_contrast). Glyphs and icons apply it at every brightness, so
+// light-on-dark text keeps the stroke weight of dark-on-light text.
+float apply_contrast_and_gamma_correction(float sample, float3 color, float enhanced_contrast, float4 gamma_ratios) {
     float brightness = color_brightness(color);
 
     float contrasted = enhance_contrast(sample, enhanced_contrast);
     return apply_alpha_correction(contrasted, brightness, gamma_ratios);
 }
 
-float3 apply_contrast_and_gamma_correction3(float3 sample, float3 color, float enhanced_contrast_factor, float4 gamma_ratios) {
-    float enhanced_contrast = light_on_dark_contrast(enhanced_contrast_factor, color);
-
+float3 apply_contrast_and_gamma_correction3(float3 sample, float3 color, float enhanced_contrast, float4 gamma_ratios) {
     float3 contrasted = enhance_contrast3(sample, enhanced_contrast);
     return apply_alpha_correction3(contrasted, color, gamma_ratios);
 }

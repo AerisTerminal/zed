@@ -38,7 +38,7 @@ cbuffer GlyphLayerTextureParams : register(b0) {
 
 float4 emoji_rasterization_fragment(PixelInput input): SV_Target {
     float sample = t_layer.Sample(s_layer, input.texcoord.xy).r;
-    float alpha_corrected = apply_contrast_and_gamma_correction(sample, run_color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+    float alpha_corrected = apply_contrast_and_gamma_correction(sample, run_color.rgb, light_on_dark_contrast(grayscale_enhanced_contrast, run_color.rgb), gamma_ratios);
     float alpha = alpha_corrected * run_color.a;
     return float4(run_color.rgb * alpha, alpha);
 }

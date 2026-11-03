@@ -28,6 +28,10 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+// With DirectWrite's default enhanced contrast, text renders lighter than
+// Chromium draws the same font on the same display. 1.0 matches Chromium's
+// stroke weight; a higher value tuned in ClearType Text Tuner is kept.
+const MINIMUM_TEXT_ENHANCED_CONTRAST: f32 = 1.0;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -858,8 +862,12 @@ impl DirectXRenderer {
                 factory.CreateRenderingParams().unwrap().cast().unwrap();
             FontInfo {
                 gamma_ratios: gpui::get_gamma_correction_ratios(render_params.GetGamma()),
-                grayscale_enhanced_contrast: render_params.GetGrayscaleEnhancedContrast(),
-                subpixel_enhanced_contrast: render_params.GetEnhancedContrast(),
+                grayscale_enhanced_contrast: render_params
+                    .GetGrayscaleEnhancedContrast()
+                    .max(MINIMUM_TEXT_ENHANCED_CONTRAST),
+                subpixel_enhanced_contrast: render_params
+                    .GetEnhancedContrast()
+                    .max(MINIMUM_TEXT_ENHANCED_CONTRAST),
                 is_bgr: render_params.GetPixelGeometry() == DWRITE_PIXEL_GEOMETRY_BGR,
             }
         })
