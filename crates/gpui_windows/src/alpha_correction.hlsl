@@ -34,8 +34,8 @@ float3 apply_alpha_correction3(float3 a, float3 b, float4 g) {
 }
 
 // Windows Terminal scales the enhanced contrast down to zero for light colors
-// (light_on_dark_contrast). Glyphs and icons apply it at every brightness, so
-// light-on-dark text keeps the stroke weight of dark-on-light text.
+// (light_on_dark_contrast). Glyphs apply it at every brightness, so light-on-dark
+// text keeps the stroke weight of dark-on-light text.
 float apply_contrast_and_gamma_correction(float sample, float3 color, float enhanced_contrast, float4 gamma_ratios) {
     float brightness = color_brightness(color);
 

@@ -4902,7 +4902,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    is_glyph: 1,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -5049,7 +5049,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            is_glyph: 0,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),

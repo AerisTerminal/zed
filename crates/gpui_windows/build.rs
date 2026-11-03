@@ -26,6 +26,14 @@ mod shader_compilation {
         let out_dir = std::env::var("OUT_DIR").unwrap();
 
         println!("cargo:rerun-if-changed={}", shader_path.display());
+        for included in ["src/alpha_correction.hlsl", "src/color_text_raster.hlsl"] {
+            println!(
+                "cargo:rerun-if-changed={}",
+                PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join(included)
+                    .display()
+            );
+        }
 
         // Check if fxc.exe is available
         let fxc_path = find_fxc_compiler();
